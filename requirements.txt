@@ -1,0 +1,6 @@
+discord.py
+requests
+psutil
+pillow
+customtkinter
+pywin32; sys_platform == 'win32'
