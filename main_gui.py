@@ -1,6 +1,7 @@
 import queue
 import sys
 import threading
+from datetime import datetime
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -228,9 +229,17 @@ class App(ctk.CTk):
             accounts.sort(key=lambda acct: (STATUS_ORDER.get(acct.get("status"), 9), str(acct.get("name", "")).lower()))
             rows = [f"{'Account':<22}{'Status':<12}{'Kicks':>6}{'Reopened':>10}  Note"]
             for acct in accounts:
+                note = acct.get("detail") or ""
+                if not note and acct.get("last_kick"):
+                    when = acct["last_kick"][11:16]
+                    try:
+                        when = datetime.fromisoformat(acct["last_kick"]).strftime("%I:%M %p").lstrip("0")
+                    except ValueError:
+                        pass
+                    note = f"last kick {when}: {acct.get('last_message') or acct.get('last_reason') or '?'}"
                 rows.append(
                     f"{str(acct.get('name', '?'))[:21]:<22}{str(acct.get('status', '?')):<12}"
-                    f"{acct.get('kicks', 0):>6}{acct.get('rejoins', 0):>10}  {acct.get('detail', '')}"
+                    f"{acct.get('kicks', 0):>6}{acct.get('rejoins', 0):>10}  {note}"
                 )
             text = "\n".join(rows)
         if text != self._last_accounts_text:

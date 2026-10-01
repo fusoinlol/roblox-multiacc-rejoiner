@@ -1,7 +1,9 @@
 """Multi-account Roblox monitor.
 
 Every running Roblox client is matched to its own Player log, and the log tells which account it is
-("Report game_join_loadtime: ... userid:N") and when it gets kicked ("Disconnection Notification. Reason: N").
+("Report game_join_loadtime: ... userid:N") and when it is disconnected - the "Disconnected" box: "Lost connection with
+reason : ..." / "Client has been disconnected with reason: ...", or on older clients "Disconnection Notification. Reason: N" -
+or a join fails ("[DFLog::NetworkClient] Failed to connect to server": the "Connection Failed ... (Error Code: 279)" box).
 When one account is kicked, only that client is closed, and only that account is reopened, by pressing its
 own Launch button on ExploitStrap's Multi Instance page. The other clients are never touched.
 
@@ -47,7 +49,13 @@ INTERNET_ENDPOINTS = (
 )
 # every normal teleport (dungeon to dungeon, back to the lobby) disconnects with this reason on purpose
 CLIENT_TELEPORT_REASON = 285
+# a join that never connects writes no "Disconnection Notification" at all - the window just sits on the "Connection Failed ...
+# No response from server (Error Code: 279)" box until someone presses Retry (30 Sep: one window sat there 5.5 hours, another
+# from 8:26 PM, while the account list said "Playing"). Roblox writes this line when it gives up on the join:
+CONNECT_FAILED_REASON = 279
+CONNECT_FAILED_TEXT = "Failed to connect to the experience. No response from server."
 REASON_NAMES = {
+    0: "disconnected",
     267: "kicked by the game",
     276: "the same account joined somewhere else",
     277: "connection lost",
@@ -59,6 +67,18 @@ USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 RE_JOIN = re.compile(r"! Joining game '([0-9a-fA-F-]+)' place (\d+)")
 RE_USERID = re.compile(r"Report game_join_loadtime: .*?\buserid:(\d+)")
 RE_DISCONNECT = re.compile(r"Disconnection Notification\. Reason: (\d+)")
+RE_CONNECT_FAILED = re.compile(r"\[DFLog::NetworkClient\] Failed to connect to server")
+# what the error box on screen says: a game's own kick text, else Roblox's disconnect text
+RE_KICK_TEXT = re.compile(r"Server Kick Message: (.*)")
+RE_DISCONNECT_TEXT = re.compile(r"(?:Client has been disconnected with reason|Lost connection with reason)\s*:\s*(.*)")
+# Roblox 0.741 (30 Sep 2026, evening) stopped writing "Disconnection Notification. Reason: N": the "Disconnected" box is now only
+# in the RE_DISCONNECT_TEXT lines, with no code (1 Oct: a kick by the anti-cheat and one by hand both wrote them; ~40 teleports
+# in the same logs never did - a teleport writes "Disconnected from server for reason: Player: 285"). The box's text gives the code.
+DISCONNECT_TEXT_REASONS = (
+    ("kicked", 267),
+    ("different device", 276),
+    ("connection", 277),
+)
 RE_ES_START = re.compile(r"Started Roblox \(PID (\d+)\)")
 RE_ES_LOG = re.compile(r"Got log file as (.+?\.log)")
 
@@ -96,10 +116,27 @@ def _valid_place_id(place_id: str) -> bool:
     return bool(place_id and place_id != DEFAULT_PLACE_ID and place_id.isdigit())
 
 
+def clean_message(text: str) -> str:
+    text = re.split(r";\s*Metadata:", text, maxsplit=1)[0]
+    text = " ".join(text.split())
+    return text[:300]
+
+
 def reason_text(reason: int | None) -> str:
     if reason is None:
         return "unknown reason"
+    if reason == 0:
+        return REASON_NAMES[0]
     return f"{REASON_NAMES.get(reason, 'disconnected')} (code {reason})"
+
+
+def reason_from_text(text: str) -> int:
+    """The code for a "Disconnected" box that only has its text in the log (Roblox 0.741 and later)."""
+    lowered = (text or "").lower()
+    for words, reason in DISCONNECT_TEXT_REASONS:
+        if words in lowered:
+            return reason
+    return 0
 
 
 def get_game_name(place_id: str) -> str:
@@ -219,6 +256,7 @@ def _account(user_id: int) -> dict:
             "rejoins": 0,
             "last_kick": None,
             "last_reason": None,
+            "last_message": None,
             "last_rejoin": None,
             "detail": "",
         }
@@ -311,8 +349,32 @@ class Client:
         self.job_id: str | None = None
         self.joined_at: float | None = None
         self.kicked_reason: int | None = None
+        self.kick_text: str | None = None
+        self.kick_text_from_game = False
+        self.connect_failed = False
         self.hung_since: float | None = None
         self.closing = False
+
+    def _note_message(self, line: str) -> None:
+        """Keep the text of the error box: the game's own kick message wins over Roblox's generic one."""
+        match = RE_KICK_TEXT.search(line)
+        if match:
+            text = clean_message(match.group(1))
+            if text:
+                self.kick_text, self.kick_text_from_game = text, True
+            return
+        match = RE_DISCONNECT_TEXT.search(line)
+        if match and not self.kick_text_from_game:
+            text = clean_message(match.group(1))
+            if text:
+                self.kick_text = text
+
+    def read_message(self) -> str | None:
+        """After the window is closed: read the rest of its log for the error box text."""
+        for line in self.log.read_lines():
+            if "Kick Message" in line or "with reason" in line:
+                self._note_message(line)
+        return self.kick_text
 
     def poll(self) -> list[tuple[str, int | None]]:
         events = []
@@ -327,7 +389,19 @@ class Client:
                     self.job_id, self.place_id = match.group(1), int(match.group(2))
                 self.joined_at = time.monotonic()
                 self.kicked_reason = None
+                self.kick_text, self.kick_text_from_game = None, False
+                self.connect_failed = False
                 events.append(("joined", None))
+            elif RE_CONNECT_FAILED.search(line):
+                self.connect_failed = True
+            elif "Kick Message" in line or "with reason" in line:
+                self._note_message(line)
+                # the "Disconnected" box (see DISCONNECT_TEXT_REASONS) - a game's kick text comes in the line before it
+                match = RE_DISCONNECT_TEXT.search(line)
+                if match and self.kicked_reason is None:
+                    reason = reason_from_text(match.group(1))
+                    self.kicked_reason = reason
+                    events.append(("kicked", reason))
             elif "Disconnection Notification" in line:
                 match = RE_DISCONNECT.search(line)
                 if match and self.kicked_reason is None:
@@ -335,6 +409,14 @@ class Client:
                     if reason != CLIENT_TELEPORT_REASON:
                         self.kicked_reason = reason
                         events.append(("kicked", reason))
+        # a failed join counts only if nothing joined after it (a log read from the start, or Retry pressed by hand, can have
+        # a failure followed by a good join)
+        if self.connect_failed and self.kicked_reason is None:
+            self.connect_failed = False
+            self.kicked_reason = CONNECT_FAILED_REASON
+            if not self.kick_text:
+                self.kick_text = CONNECT_FAILED_TEXT
+            events.append(("kicked", CONNECT_FAILED_REASON))
         return events
 
 
@@ -497,11 +579,28 @@ $TS = [System.Windows.Automation.TreeScope]
 $CT = [System.Windows.Automation.ControlType]
 $user = '__USER__'
 $exe = '__EXE__'
+# ExploitStrap's processes, whatever its exe is called (a renamed "ExploitStrap (1).exe" is not "ExploitStrap")
+function Strap-Processes { Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like '*strap*' } }
+# its window: any top-level window titled "ExploitStrap..." that belongs to one of those processes (the Settings one first). The
+# process's "main window" alone missed it on another PC while the window was open on screen ("the ExploitStrap window is not open")
 function Find-Window {
-  foreach ($p in Get-Process ExploitStrap -ErrorAction SilentlyContinue) {
-    if ($p.MainWindowHandle -ne 0 -and $p.MainWindowTitle -like 'ExploitStrap*') { return $A::FromHandle($p.MainWindowHandle) }
+  $ids = @{}
+  foreach ($p in Strap-Processes) { $ids[[int]$p.Id] = $true }
+  if ($ids.Count -eq 0) { return $null }
+  $tops = $A::RootElement.FindAll($TS::Children, [System.Windows.Automation.Condition]::TrueCondition)
+  foreach ($want in @('ExploitStrap*Settings*', 'ExploitStrap*')) {
+    foreach ($e in $tops) {
+      try { if ($ids.ContainsKey([int]$e.Current.ProcessId) -and $e.Current.Name -like $want) { return $e } } catch {}
+    }
   }
   return $null
+}
+# Windows hides an administrator program's window from a normal one: ExploitStrap run as administrator, the rejoiner not
+function Strap-Elevated {
+  $me = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  if ($me) { return $false }
+  foreach ($p in Strap-Processes) { try { if (-not $p.Path) { return $true } } catch { return $true } }
+  return $false
 }
 function Find-Launch($win) {
   $all = $win.FindAll($TS::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
@@ -533,11 +632,16 @@ if (-not $win -and (Test-Path $exe)) {
   Start-Process -FilePath $exe -ArgumentList '-settings'
   for ($i = 0; $i -lt 40 -and -not $win; $i++) { Start-Sleep -Milliseconds 500; $win = Find-Window }
 }
-if (-not $win) { 'ERR: the ExploitStrap window is not open'; exit 2 }
+if (-not $win) {
+  if (Strap-Elevated) { 'ERR: ExploitStrap is running as administrator - run the rejoiner as administrator too'; exit 2 }
+  if (Strap-Processes) { "ERR: ExploitStrap is running but its window is closed (in the tray?) - open it on the Multi Instance page"; exit 2 }
+  'ERR: the ExploitStrap window is not open'; exit 2
+}
 $btn = Find-Launch $win
 if (-not $btn) {
   if (Open-MultiInstance $win) { Start-Sleep -Milliseconds 1500; $btn = Find-Launch $win }
 }
+if (-not $btn -and (Strap-Elevated)) { 'ERR: ExploitStrap is running as administrator - run the rejoiner as administrator too'; exit 3 }
 if (-not $btn) { "ERR: no Launch button for @$user on ExploitStrap's Multi Instance page"; exit 3 }
 $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
 'OK'
@@ -683,20 +787,23 @@ def start_rejoin(user_id: int, why: str) -> bool:
 def _on_kick(client: Client, reason: int) -> None:
     client.closing = True
     close_client(client.pid)
+    # the window is closed at once (before Roblox can reload it); the error box text is read from its log afterwards
+    message = client.read_message()
+    said = f': "{message}"' if message else ""
     now = datetime.now().isoformat()
     name = account_name(client.user_id)
     with state_lock:
         state["disconnect_count"] += 1
         state["last_disconnect"] = now
-        state["last_disconnect_reason"] = reason_text(reason)
+        state["last_disconnect_reason"] = reason_text(reason) + said
         if client.user_id is not None:
             acct = _account(client.user_id)
             acct["kicks"] += 1
-            acct.update(status="Kicked", pid=None, last_kick=now, last_reason=reason_text(reason))
+            acct.update(status="Kicked", pid=None, last_kick=now, last_reason=reason_text(reason), last_message=message)
     if client.user_id is None:
-        add_event("kick", name, f"{reason_text(reason)} before it joined a game - closed its window")
+        add_event("kick", name, f"{reason_text(reason)}{said} - before it joined a game; closed its window")
         return
-    add_event("kick", name, f"{reason_text(reason)} - closed its window, reopening it in {REJOIN_DELAY:g}s")
+    add_event("kick", name, f"{reason_text(reason)}{said} - closed its window, reopening it in {REJOIN_DELAY:g}s")
     start_rejoin(client.user_id, "kicked")
 
 

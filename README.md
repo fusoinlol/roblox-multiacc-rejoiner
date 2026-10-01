@@ -13,11 +13,17 @@ accounts are never touched.
 Accounts are reopened through ExploitStrap: the monitor presses that account's own **Launch** button on ExploitStrap's
 **Multi Instance** page (Windows UI Automation - no mouse or keyboard). ExploitStrap signs the account in; the rejoiner
 never reads any login. Keep ExploitStrap's settings window open (if it is closed, the monitor opens it with `-settings`).
-The account joins whatever Place ID is set on that page.
+The account joins whatever Place ID is set on that page. If ExploitStrap runs as administrator, run the rejoiner as
+administrator too - Windows hides an administrator program's window from a normal one.
 
 - Which account a window belongs to comes from its own Player log (`Report game_join_loadtime: ... userid:N`), and which
   log belongs to which window from ExploitStrap's log (`Started Roblox (PID n)` / `Got log file as ...`).
-- A kick is any `Disconnection Notification. Reason: N` other than 285 - 285 is every normal teleport.
+- A kick is the "Disconnected" box: the log's `Lost connection with reason : ...` or `Client has been disconnected with
+  reason: ...` (Roblox 0.741 and later), or `Disconnection Notification. Reason: N` other than 285 on older clients. A normal
+  teleport writes neither (it writes `Disconnected from server for reason: Player: 285`).
+- A join that never connects counts as a kick too (code 279): Roblox writes `[DFLog::NetworkClient] Failed to connect to
+  server` and shows the "Connection Failed ... No response from server" box, with no disconnect line at all. A later
+  `! Joining game` in the same window (Retry pressed by hand) clears it.
 - A kicked window is closed within about half a second: roughly 4 seconds after a disconnect, Roblox reloads the
   client, and that reload closed every other open client too.
 - An account is never launched while a window of it is still in game (a second copy disconnects the first with 276).
