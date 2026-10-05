@@ -12,6 +12,9 @@ Two things learned the hard way (30 Sep 2026):
   So a kicked client is closed at once (the log is polled twice a second), before the reload can start.
 - launching an account that is already running disconnects the running copy (reason 276), which triggers the same
   reload. An account is never launched while a client for it is alive.
+
+An account kicked by Harvard Labs' mod detection (a player not on its whitelist joined or asked to join the run) is closed
+like any kicked one but not reopened - see MOD_KICK_NOTE.
 """
 import base64
 import ctypes
@@ -24,7 +27,7 @@ import subprocess
 import threading
 import time
 from ctypes import wintypes
-from datetime import datetime
+from datetime import datetime, timezone
 from glob import glob
 
 import psutil
@@ -57,8 +60,10 @@ CONNECT_FAILED_TEXT = "Failed to connect to the experience. No response from ser
 REASON_NAMES = {
     0: "disconnected",
     267: "kicked by the game",
+    273: "the same account joined from another device",
     276: "the same account joined somewhere else",
     277: "connection lost",
+    278: "idle for 20 minutes",
     279: "failed to connect",
 }
 POLL_SECONDS = 0.5
@@ -79,8 +84,27 @@ DISCONNECT_TEXT_REASONS = (
     ("different device", 276),
     ("connection", 277),
 )
+# Roblox 0.741 (5 Oct 2026): an idle kick ("You were disconnected for being idle 20 minutes", 278) writes none of the lines
+# above - only "Client:Disconnect setting replicator disconnect reason to 278", "Sending disconnect with reason: 278" (x3) and a
+# transport line that says "Player: 285 (DisconnectClientInitiated)" like any teleport. In this PC's logs every teleport's
+# client disconnect is 285 (492 of 492); the other codes seen there were 278 (the idle kick) and 273 (another device).
+RE_CLIENT_REASON = re.compile(r"(?:setting replicator disconnect reason to|Sending disconnect with reason:)\s*(\d+)")
+REASON_TEXTS = {
+    273: "Same account launched experience from different device.",
+    278: "You were disconnected for being idle 20 minutes.",
+}
 RE_ES_START = re.compile(r"Started Roblox \(PID (\d+)\)")
 RE_ES_LOG = re.compile(r"Got log file as (.+?\.log)")
+# a Player log is named after the moment Roblox created it, in UTC: ..._20261002T070456Z_Player_AC316_last.log
+RE_LOG_STAMP = re.compile(r"_(\d{8}T\d{6})Z_Player_[0-9A-Fa-f]+_last\.log$")
+# how long a client may run before its log is matched by start time (ExploitStrap names it about 2 s after the start)
+LOG_MATCH_AFTER = 8.0
+# Harvard Labs' mod detection kicks the account itself and writes this note in the executor's workspace folder first: a kick
+# from the account's own script reaches the Player log only as "Lost connection with reason : You have been kicked from the
+# game" - its message is not in the log (2 Oct 2026). An account with a note from the last MOD_KICK_NOTE_AGE seconds is
+# not reopened.
+MOD_KICK_NOTE = os.path.join("HarvardLabs", "data", "modkick_{user_id}.json")
+MOD_KICK_NOTE_AGE = 120.0
 
 PLACE_ID = DEFAULT_PLACE_ID
 REJOIN_DELAY = 5.0
@@ -95,6 +119,7 @@ LAUNCH_TIMEOUT = 120.0
 LAUNCH_ATTEMPTS = 3
 ROBLOX_LOG_DIR = ""
 EXPLOITSTRAP_DIR = ""
+WORKSPACE_DIR = ""
 
 MONITOR_ACTIVE = True
 SOCKET_ACTIVE = True
@@ -137,6 +162,35 @@ def reason_from_text(text: str) -> int:
         if words in lowered:
             return reason
     return 0
+
+
+def workspace_dirs() -> list[str]:
+    """The executor workspace folders that may hold Harvard Labs' notes: WORKSPACE_DIR when it is set, else every
+    %LOCALAPPDATA%\\<executor>\\workspace."""
+    if WORKSPACE_DIR:
+        return [os.path.expandvars(WORKSPACE_DIR)]
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    return glob(os.path.join(local_app_data, "*", "workspace")) if local_app_data else []
+
+
+def mod_kick_note(user_id: int | None, now: float | None = None) -> str | None:
+    """The kick text when Harvard Labs' mod detection kicked this account in the last MOD_KICK_NOTE_AGE seconds, else None."""
+    if user_id is None:
+        return None
+    now = time.time() if now is None else now
+    for folder in workspace_dirs():
+        try:
+            with open(os.path.join(folder, MOD_KICK_NOTE.format(user_id=user_id)), "r", encoding="utf-8") as note_file:
+                note = json.load(note_file)
+            at = float(note["at"])
+        except (OSError, ValueError, TypeError, KeyError):
+            continue
+        if note.get("userId") not in (None, user_id):
+            continue
+        # the note is written just before the kick, in whole seconds
+        if -5.0 <= now - at <= MOD_KICK_NOTE_AGE:
+            return clean_message(f"Harvard Labs mod detection: {note.get('why') or 'a player not on the whitelist'}")
+    return None
 
 
 def get_game_name(place_id: str) -> str:
@@ -199,7 +253,7 @@ _manual_requests: list[int] = []
 def reload_monitor_config(fetch_game_name: bool = False) -> None:
     """Reload settings without requiring either service to be re-imported."""
     global PLACE_ID, REJOIN_DELAY, SOCKET_HOST, SOCKET_PORT, SOCKET_AUTH, GAME_NAME, GAME_URL
-    global REOPEN_CLOSED, FREEZE_SECONDS, LAUNCH_TIMEOUT, LAUNCH_ATTEMPTS, ROBLOX_LOG_DIR, EXPLOITSTRAP_DIR
+    global REOPEN_CLOSED, FREEZE_SECONDS, LAUNCH_TIMEOUT, LAUNCH_ATTEMPTS, ROBLOX_LOG_DIR, EXPLOITSTRAP_DIR, WORKSPACE_DIR
 
     config = load_config()
     PLACE_ID = str(config.get("PLACE_ID", DEFAULT_PLACE_ID)).strip()
@@ -217,6 +271,7 @@ def reload_monitor_config(fetch_game_name: bool = False) -> None:
     local_app_data = os.environ.get("LOCALAPPDATA", "")
     ROBLOX_LOG_DIR = str(config.get("ROBLOX_LOG_DIR") or os.path.join(local_app_data, "Roblox", "logs"))
     EXPLOITSTRAP_DIR = str(config.get("EXPLOITSTRAP_DIR") or os.path.join(local_app_data, "ExploitStrap"))
+    WORKSPACE_DIR = str(config.get("WORKSPACE_DIR") or "")
     GAME_NAME = get_game_name(PLACE_ID) if fetch_game_name else (
         "Not Set" if not _valid_place_id(PLACE_ID) else f"Place {PLACE_ID}"
     )
@@ -394,6 +449,16 @@ class Client:
                 events.append(("joined", None))
             elif RE_CONNECT_FAILED.search(line):
                 self.connect_failed = True
+            elif "replicator disconnect reason" in line or "Sending disconnect with reason" in line:
+                # (before the "with reason" lines below: "Sending disconnect with reason: N" has those words too)
+                match = RE_CLIENT_REASON.search(line)
+                if match and self.kicked_reason is None:
+                    reason = int(match.group(1))
+                    if reason != CLIENT_TELEPORT_REASON:
+                        self.kicked_reason = reason
+                        if not self.kick_text and reason in REASON_TEXTS:
+                            self.kick_text = REASON_TEXTS[reason]
+                        events.append(("kicked", reason))
             elif "Kick Message" in line or "with reason" in line:
                 self._note_message(line)
                 # the "Disconnected" box (see DISCONNECT_TEXT_REASONS) - a game's kick text comes in the line before it
@@ -424,14 +489,20 @@ class ClientLocator:
     """Finds which Player log belongs to which Roblox process.
 
     ExploitStrap writes "Started Roblox (PID n)" and "Got log file as <path>" for every client it starts - including
-    the reloads Roblox asks it for. Anything else falls back to asking Windows which log the process holds open.
+    the reloads Roblox asks it for. A client it did not name is matched to the Player log Roblox created just after the
+    process started (the log's name carries that time).
+
+    It never asks Windows which files a client holds open: psutil's open_files() kills its own helper threads with
+    TerminateThread when a handle does not answer. On 2 Oct 2026, after ten clients were launched in a row, that left this
+    process unable to start any thread at all - the monitor hung in Thread.start (so a 279 went unanswered), then the GUI's
+    Start button and the Discord bot did too.
     """
 
     def __init__(self):
         self.pid_to_log: dict[int, str] = {}
         self._tails: dict[str, LogTail] = {}
         self._last_pid: dict[str, int] = {}
-        self._fallback_at: dict[int, float] = {}
+        self._first_seen: dict[int, float] = {}
 
     def scan_exploitstrap(self) -> None:
         cutoff = time.time() - 3 * 86400
@@ -457,23 +528,39 @@ class ClientLocator:
         path = self.pid_to_log.get(pid)
         if path:
             return path
+        # ExploitStrap names the log a couple of seconds after it starts the client: give it that time before matching
         now = time.monotonic()
-        if now - self._fallback_at.get(pid, -1e9) < 20:
+        if now - self._first_seen.setdefault(pid, now) < LOG_MATCH_AFTER:
             return None
-        self._fallback_at[pid] = now
         try:
-            for opened in psutil.Process(pid).open_files():
-                name = os.path.basename(opened.path).lower()
-                if name.endswith(".log") and "player" in name:
-                    self.pid_to_log[pid] = opened.path
-                    return opened.path
+            started = psutil.Process(pid).create_time()
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            pass
-        return None
+            return None
+        path = self.log_by_start_time(started)
+        if path:
+            self.pid_to_log[pid] = path
+        return path
+
+    def log_by_start_time(self, started: float) -> str | None:
+        """The Player log created closest after a process start (not one already matched to another client)."""
+        taken = set(self.pid_to_log.values())
+        best, best_gap = None, None
+        for path in glob(os.path.join(ROBLOX_LOG_DIR, "*_Player_*_last.log")):
+            match = RE_LOG_STAMP.search(os.path.basename(path))
+            if not match or path in taken:
+                continue
+            try:
+                stamp = datetime.strptime(match.group(1), "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+            gap = stamp - started
+            if -2.0 <= gap <= 30.0 and (best_gap is None or abs(gap) < abs(best_gap)):
+                best, best_gap = path, gap
+        return best
 
     def forget(self, pid: int) -> None:
         self.pid_to_log.pop(pid, None)
-        self._fallback_at.pop(pid, None)
+        self._first_seen.pop(pid, None)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -789,6 +876,10 @@ def _on_kick(client: Client, reason: int) -> None:
     close_client(client.pid)
     # the window is closed at once (before Roblox can reload it); the error box text is read from its log afterwards
     message = client.read_message()
+    # Harvard Labs' mod detection kicked it on purpose: its note has the real text (the log only says "kicked"), and it stays closed
+    mod_kick = mod_kick_note(client.user_id)
+    if mod_kick:
+        message = mod_kick
     said = f': "{message}"' if message else ""
     now = datetime.now().isoformat()
     name = account_name(client.user_id)
@@ -800,8 +891,13 @@ def _on_kick(client: Client, reason: int) -> None:
             acct = _account(client.user_id)
             acct["kicks"] += 1
             acct.update(status="Kicked", pid=None, last_kick=now, last_reason=reason_text(reason), last_message=message)
+            if mod_kick:
+                acct["detail"] = f"not reopened - {mod_kick}"
     if client.user_id is None:
         add_event("kick", name, f"{reason_text(reason)}{said} - before it joined a game; closed its window")
+        return
+    if mod_kick:
+        add_event("kick", name, f"{reason_text(reason)}{said} - closed its window; not reopening it (mod detection kicked it)")
         return
     add_event("kick", name, f"{reason_text(reason)}{said} - closed its window, reopening it in {REJOIN_DELAY:g}s")
     start_rejoin(client.user_id, "kicked")

@@ -1,8 +1,10 @@
+import json
 import os
 import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -35,6 +37,18 @@ SERVER_KICK_0741 = ("2026-10-01T03:40:55.588Z,1580.588989,1c74,6,Error [FLog::Cr
                     "been kicked from the game\n"
                     "2026-10-01T03:40:56.628Z,1581.628296,3738,7,Warning [FLog::Network] Lost connection with reason : You have been "
                     "kicked from the game\n")
+# the idle kick (5 Oct 2026, 8:44 AM, error 278): only these lines - the transport line says 285 like a teleport
+IDLE_KICK_0741 = ("2026-10-05T13:44:06.576Z,13748.576172,7638,6,Info [DFLog::NetworkClient] Client:Disconnect\n"
+                  "2026-10-05T13:44:06.576Z,13748.576172,7638,6,Info [DFLog::NetworkClient] Client:Disconnect setting replicator "
+                  "disconnect reason to 278\n"
+                  "2026-10-05T13:44:06.585Z,13748.585938,8210,7 [FLog::Network] Sending disconnect with reason: 278\n"
+                  "2026-10-05T13:44:06.585Z,13748.585938,8210,7 [FLog::Network] Sending disconnect with reason: 278\n"
+                  "2026-10-05T13:44:06.608Z,13748.608398,69e0,6,Info [DFLog::RbxTransportDummyClient] Disconnected from server for "
+                  "reason: Player: 285 (DisconnectClientInitiated)\n")
+# a teleport's own client lines (5 Oct 2026)
+TELEPORT_SEND_0741 = ("2026-10-05T13:15:34.990Z,12036.990234,69e0,7 [FLog::Network] Sending disconnect with reason: 285\n"
+                      "2026-10-05T13:15:35.012Z,12037.012695,69e0,6,Info [DFLog::RbxTransportDummyClient] Disconnected from server "
+                      "for reason: Player: 285 (DisconnectClientInitiated)\n")
 TELEPORT_0741 = ("2026-10-01T05:49:52.382Z,9317.382812,3738,6,Info [DFLog::RbxTransportDummyClient] Disconnected from server for "
                  "reason: Player: 285 (DisconnectClientInitiated)\n")
 
@@ -125,6 +139,21 @@ class ClientLogTests(unittest.TestCase):
         self.assertNotIn("kicked", [kind for kind, _ in client.poll()])
         self.assertIsNone(client.kicked_reason)
 
+    def test_idle_kick_is_one_kick_with_its_text(self):
+        self.write(JOIN + LOADTIME)
+        client = roblox_monitor.Client(1234, str(self.path))
+        self.assertEqual(client.poll(), [("joined", None)])
+        self.write(IDLE_KICK_0741)
+        self.assertEqual(client.poll(), [("kicked", 278)])
+        self.assertEqual(client.read_message(), "You were disconnected for being idle 20 minutes.")
+        self.assertEqual(roblox_monitor.reason_text(278), "idle for 20 minutes (code 278)")
+
+    def test_teleport_client_disconnect_285_is_not_a_kick(self):
+        self.write(JOIN + LOADTIME + TELEPORT_SEND_0741 + JOIN)
+        client = roblox_monitor.Client(1234, str(self.path))
+        self.assertNotIn("kicked", [kind for kind, _ in client.poll()])
+        self.assertIsNone(client.kicked_reason)
+
     def test_unknown_disconnect_text_still_counts(self):
         self.write(JOIN + LOADTIME + "2026-10-01T08:00:00.000Z,1.0,3738,7,Warning [FLog::Network] Lost connection with reason : "
                    "The server has shut down\n")
@@ -147,6 +176,45 @@ class LocatorTests(unittest.TestCase):
                 locator = roblox_monitor.ClientLocator()
                 locator.scan_exploitstrap()
             self.assertEqual(locator.pid_to_log[8344], "C:\\logs\\0.740_Player_B3C54_last.log")
+
+    def _logs(self, temp_dir, names):
+        for name in names:
+            (Path(temp_dir) / name).write_text("", encoding="utf-8")
+
+    def test_start_time_match_picks_the_log_made_just_after_the_start(self):
+        # 2 Oct 2026: process started 07:04:54 UTC, Roblox created its log at 07:04:56
+        started = datetime(2026, 10, 2, 7, 4, 54, tzinfo=timezone.utc).timestamp()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._logs(temp_dir, [
+                "0.741.0.7411058_20261002T070426Z_Player_ECE05_last.log",                # 28 s before the start
+                "0.741.0.7411058_20261002T070456Z_Player_AC316_last.log",                # 2 s after: this one
+                "0.741.0.7411058_20261002T070456Z_Player_228A4_CrashHandler_last.log",   # crash handler, never
+                "0.741.0.7411058_20261002T070527Z_Player_0A8A9_last.log",                # 33 s after: too late
+            ])
+            with mock.patch.object(roblox_monitor, "ROBLOX_LOG_DIR", temp_dir):
+                locator = roblox_monitor.ClientLocator()
+                found = locator.log_by_start_time(started)
+                self.assertEqual(os.path.basename(found), "0.741.0.7411058_20261002T070456Z_Player_AC316_last.log")
+                # a log already matched to another client is never handed out twice
+                locator.pid_to_log[999] = found
+                self.assertIsNone(locator.log_by_start_time(started))
+
+    def test_log_for_waits_for_exploitstrap_and_never_asks_for_open_files(self):
+        started = datetime(2026, 10, 2, 7, 4, 54, tzinfo=timezone.utc).timestamp()
+        process = mock.Mock()
+        process.create_time.return_value = started
+        process.open_files.side_effect = AssertionError("open_files() must never be called")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._logs(temp_dir, ["0.741.0.7411058_20261002T070456Z_Player_AC316_last.log"])
+            with mock.patch.object(roblox_monitor, "ROBLOX_LOG_DIR", temp_dir), \
+                    mock.patch.object(roblox_monitor.psutil, "Process", return_value=process):
+                locator = roblox_monitor.ClientLocator()
+                # inside the wait ExploitStrap gets to name the log, nothing is guessed
+                self.assertIsNone(locator.log_for(31880))
+                with mock.patch.object(roblox_monitor, "LOG_MATCH_AFTER", 0.0):
+                    found = locator.log_for(31880)
+            self.assertEqual(os.path.basename(found), "0.741.0.7411058_20261002T070456Z_Player_AC316_last.log")
+            process.open_files.assert_not_called()
 
 
 def wait_for_workers(timeout=10):
@@ -207,6 +275,67 @@ class RejoinTests(unittest.TestCase):
             roblox_monitor.clients[4] = back
             wait_for_workers()
         launch.assert_not_called()
+
+    @staticmethod
+    def _mod_kick_note(workspace, user_id, at, why="a player not on the whitelist asked to join the run (Stranger1)"):
+        folder = os.path.join(workspace, "HarvardLabs", "data")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, f"modkick_{user_id}.json"), "w", encoding="utf-8") as note:
+            json.dump({"at": at, "userId": user_id, "name": "FarmAlt", "why": why, "job": "407e003c"}, note)
+
+    def test_mod_detection_kick_is_closed_but_not_reopened(self):
+        # 2 Oct: the script's own kick logs only "You have been kicked from the game" - the note it writes first tells
+        kicked = roblox_monitor.Client(1, os.devnull)
+        kicked.user_id, kicked.joined_at = 111, time.monotonic()
+        roblox_monitor.clients[1] = kicked
+        with tempfile.TemporaryDirectory() as workspace:
+            self._mod_kick_note(workspace, 111, int(time.time()))
+            with mock.patch.object(roblox_monitor, "WORKSPACE_DIR", workspace), \
+                    mock.patch.object(roblox_monitor, "close_client") as close, \
+                    mock.patch.object(roblox_monitor, "launch_account") as launch, \
+                    mock.patch.object(roblox_monitor, "REJOIN_DELAY", 0), \
+                    mock.patch.object(roblox_monitor, "wait_for_internet", return_value=True):
+                roblox_monitor._on_kick(kicked, 267)
+                wait_for_workers()
+        close.assert_called_once_with(1)
+        launch.assert_not_called()
+        self.assertEqual([event["kind"] for event in roblox_monitor.state["events"]], ["kick"])
+        acct = roblox_monitor.state["accounts"]["111"]
+        self.assertEqual(acct["status"], "Kicked")
+        self.assertEqual(acct["last_message"], "Harvard Labs mod detection: a player not on the whitelist asked to join the run (Stranger1)")
+        self.assertIn("not reopened", acct["detail"])
+
+    def test_an_old_mod_detection_note_does_not_stop_a_reopen(self):
+        kicked = roblox_monitor.Client(1, os.devnull)
+        kicked.user_id, kicked.joined_at = 111, time.monotonic()
+        roblox_monitor.clients[1] = kicked
+
+        def fake_launch(name):
+            fresh = roblox_monitor.Client(3, os.devnull)
+            fresh.user_id, fresh.joined_at = 111, time.monotonic() + 1
+            roblox_monitor.clients[3] = fresh
+            return True, "OK"
+
+        with tempfile.TemporaryDirectory() as workspace:
+            self._mod_kick_note(workspace, 111, int(time.time()) - 3600)
+            with mock.patch.object(roblox_monitor, "WORKSPACE_DIR", workspace), \
+                    mock.patch.object(roblox_monitor, "close_client"), \
+                    mock.patch.object(roblox_monitor, "launch_account", side_effect=fake_launch) as launch, \
+                    mock.patch.object(roblox_monitor, "REJOIN_DELAY", 0), \
+                    mock.patch.object(roblox_monitor, "wait_for_internet", return_value=True):
+                roblox_monitor._on_kick(kicked, 267)
+                wait_for_workers()
+        launch.assert_called_once_with("FarmAlt")
+        self.assertEqual([event["kind"] for event in roblox_monitor.state["events"]], ["kick", "rejoined"])
+
+    def test_mod_kick_note_is_per_account_and_found_in_any_executor_workspace(self):
+        with tempfile.TemporaryDirectory() as local_app_data:
+            self._mod_kick_note(os.path.join(local_app_data, "SomeExecutor", "workspace"), 222, int(time.time()))
+            with mock.patch.object(roblox_monitor, "WORKSPACE_DIR", ""), \
+                    mock.patch.dict(os.environ, {"LOCALAPPDATA": local_app_data}):
+                self.assertIsNone(roblox_monitor.mod_kick_note(111))
+                self.assertIn("(Stranger1)", roblox_monitor.mod_kick_note(222))
+                self.assertIsNone(roblox_monitor.mod_kick_note(None))
 
     def test_socket_command_requires_matching_auth(self):
         with mock.patch.object(roblox_monitor, "SOCKET_AUTH", "secret"):

@@ -27,6 +27,14 @@ administrator too - Windows hides an administrator program's window from a norma
 - A kicked window is closed within about half a second: roughly 4 seconds after a disconnect, Roblox reloads the
   client, and that reload closed every other open client too.
 - An account is never launched while a window of it is still in game (a second copy disconnects the first with 276).
+- Roblox's idle kick ("You were disconnected for being idle 20 minutes", error 278) counts as a kick and is reopened.
+  Roblox 0.741 logs it only as "setting replicator disconnect reason to 278" (next to a transport line that says 285, like
+  a teleport), so the monitor reads the code from that line.
+- An account kicked by Harvard Labs' mod detection (a player not on its whitelist joined or asked to join the run) is closed
+  but **not** reopened. Roblox's log only says "You have been kicked from the game" for a kick by the account's own script,
+  so the script writes `HarvardLabs\data\modkick_<userId>.json` in your executor's workspace folder just before it kicks.
+  The monitor looks in every `%LOCALAPPDATA%\<executor>\workspace` folder; if your executor keeps its workspace somewhere
+  else, put that folder in `WORKSPACE_DIR` in `config.json`. Reopen the account by hand or with `/rejoin`.
 - Optional: "Also reopen accounts whose window closes or crashes" (off by default).
 
 If the connection is offline, recovery waits until a Roblox endpoint is reachable. A launch that does not bring the

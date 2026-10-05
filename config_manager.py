@@ -22,7 +22,8 @@ DEFAULT_CONFIG = {
     "LAUNCH_TIMEOUT": 120,
     "LAUNCH_ATTEMPTS": 3,
     "ROBLOX_LOG_DIR": "",
-    "EXPLOITSTRAP_DIR": ""
+    "EXPLOITSTRAP_DIR": "",
+    "WORKSPACE_DIR": ""
 }
 
 
